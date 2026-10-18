@@ -974,3 +974,74 @@ def test_selector_subcommand_help_shows_options(capsys):
     assert "--text" in out
     assert "--child-text" in out
     assert "--child" in out
+
+
+@pytest.mark.parametrize("argv, operation_timeout", [
+    (["wait", "--text", "absent", "--timeout", "35"], 35),
+    (["wait", "--text", "present", "--gone", "--timeout", "35"], 35),
+    (["exists", "--text", "absent", "--timeout", "35"], 35),
+    (["click", "--text", "target", "--timeout", "35"], 35),
+    (["long-click", "--text", "target", "--timeout", "35"], 35),
+    (["shell", "--timeout", "45", "echo", "hello"], 45),
+    (["shell", "echo", "hello"], 60),
+])
+def test_transport_timeout_outlasts_requested_operation(argv, operation_timeout):
+    response = BytesIO(json.dumps({"ok": True, "result": {"result": False}}).encode())
+    client = agent_client.U2CliClient()
+    with patch("uiautomator2.agent_cli.commands.ensure_server", return_value=(client, False)):
+        with patch("uiautomator2.agent_cli.client.request.urlopen", return_value=response) as urlopen:
+            main(argv)
+
+    request = urlopen.call_args.args[0]
+    assert json.loads(request.data)["params"]["timeout"] == operation_timeout
+    transport_timeout = urlopen.call_args.kwargs["timeout"]
+    assert operation_timeout < transport_timeout <= operation_timeout + 30
+
+
+@pytest.mark.parametrize("argv", [
+    ["device-info"],
+    ["wait", "--text", "absent", "--timeout", "2"],
+    ["exists", "--text", "absent", "--timeout", "0"],
+])
+def test_short_operations_keep_default_transport_timeout(argv):
+    response = BytesIO(json.dumps({"ok": True, "result": {"result": False}}).encode())
+    with patch("uiautomator2.agent_cli.commands.ensure_server", return_value=(agent_client.U2CliClient(), False)):
+        with patch("uiautomator2.agent_cli.client.request.urlopen", return_value=response) as urlopen:
+            main(argv)
+
+    assert urlopen.call_args.kwargs["timeout"] == 30.0
+
+
+@pytest.mark.parametrize("response", [[], [1], None, "text", 42, 1.5, True, False])
+def test_client_rejects_non_object_json_response(response):
+    client = agent_client.U2CliClient()
+    with patch("uiautomator2.agent_cli.client.request.urlopen",
+               return_value=BytesIO(json.dumps(response).encode())):
+        with pytest.raises(agent_client.U2CliError, match="invalid response.*expected a JSON object"):
+            client.status()
+
+
+@pytest.mark.parametrize("response", [[], [1], None, "text", 42, 1.5, True, False])
+def test_client_is_running_handles_non_object_json_response(response):
+    client = agent_client.U2CliClient()
+    with patch("uiautomator2.agent_cli.client.request.urlopen",
+               return_value=BytesIO(json.dumps(response).encode())):
+        assert client.is_running() is False
+
+
+@pytest.mark.parametrize("result", [{"protocol_version": 13}, [], None, "text", 42, True, False])
+def test_client_accepts_json_object_response_with_any_result(result):
+    with patch("uiautomator2.agent_cli.client.request.urlopen",
+               return_value=BytesIO(json.dumps({"ok": True, "result": result}).encode())):
+        assert agent_client.U2CliClient().request("test") == result
+
+
+@pytest.mark.parametrize("response, message", [
+    ({"ok": False, "error": "device unavailable"}, "device unavailable"),
+    ({}, "unknown u2cli server error"),
+])
+def test_client_json_object_error_response_still_raises_remote_error(response, message):
+    with patch("uiautomator2.agent_cli.client.request.urlopen",
+               return_value=BytesIO(json.dumps(response).encode())):
+        with pytest.raises(agent_client.RemoteError, match=message):
+            agent_client.U2CliClient().request("test")
