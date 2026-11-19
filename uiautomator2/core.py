@@ -6,11 +6,11 @@
 
 import atexit
 import datetime
-import hashlib
 import json
 import logging
 import os
 import socket
+import stat
 import threading
 import time
 from http.client import HTTPConnection, HTTPException
@@ -29,6 +29,16 @@ from uiautomator2.version import __apk_version__
 logger = logging.getLogger(__name__)
 
 DEFAULT_SERVER_PORT = 9008
+DEFAULT_JAR_PATH = "/data/local/tmp/u2.jar"
+
+
+def get_jar_path() -> str:
+    """Path of u2.jar on the device, override with U2_JAR_PATH.
+
+    Some devices ship risk-control software that scans /data/local/tmp, so the
+    jar can be moved elsewhere.
+    """
+    return os.environ.get("U2_JAR_PATH") or DEFAULT_JAR_PATH
 
 
 def check_port(port: int) -> None:
@@ -73,9 +83,12 @@ class MockAdbProcess:
         self.wait()
 
 
-def launch_uiautomator(dev: adbutils.AdbDevice, port: int) -> MockAdbProcess:
+def launch_uiautomator(dev: adbutils.AdbDevice, port: int, jar_path: Optional[str] = None) -> MockAdbProcess:
     """Launch uiautomator2 server on device"""
-    command = f"CLASSPATH=/data/local/tmp/u2.jar app_process / com.wetest.uia2.Main -p {port}"
+    if not jar_path:
+        jar_path = get_jar_path()
+    # single quotes keep a custom path with spaces usable by the device shell
+    command = f"CLASSPATH='{jar_path}' app_process / com.wetest.uia2.Main -p {port}"
     logger.debug("launch uiautomator with cmd: %s", command)
     conn = dev.shell(command, stream=True)
     process = MockAdbProcess(conn)
@@ -228,6 +241,7 @@ class BasicUiautomatorServer(AbstractUiautomatorServer):
         self._process = None
         self._debug = False
         self._device_server_port = device_server_port
+        self._jar_path = get_jar_path()
         self.start_uiautomator()
         atexit.register(self.stop_uiautomator, wait=False)
     
@@ -252,29 +266,38 @@ class BasicUiautomatorServer(AbstractUiautomatorServer):
                 if self._process.pool() is not None:
                     self._process = None
             if not self._check_alive():
-                self._process = launch_uiautomator(self._dev, self._device_server_port)
+                self._process = launch_uiautomator(self._dev, self._device_server_port, self._jar_path)
                 self._wait_ready()
 
     def _setup_jar(self):
+        target_path = self._jar_path
+        if self._dev.sync.stat(target_path).mode & stat.S_IFDIR:
+            # Some devices already have a directory at the jar path. adb push
+            # would then write <path>/u2.jar while size check and CLASSPATH
+            # still use the directory, so the server never starts.
+            logger.warning("%s is a directory on device, removing it", target_path)
+            self._dev.shell(["rm", "-rf", target_path])
         with with_package_resource("assets/u2.jar") as jar_path:
-            target_path = "/data/local/tmp/u2.jar"
-            if self._check_device_file_hash(jar_path, target_path):
+            if self._check_device_file_size(jar_path, target_path):
                 logger.debug("file u2.jar already pushed")
             else:
+                # a custom U2_JAR_PATH may point into a directory that does
+                # not exist yet
+                parent_dir = os.path.dirname(target_path)
+                if parent_dir:
+                    self._dev.shell(["mkdir", "-p", parent_dir])
                 logger.debug("push %s -> %s", jar_path, target_path)
                 self._dev.sync.push(jar_path, target_path, check=True)
     
-    def _check_device_file_hash(self, local_file: Union[str, Path], remote_file: str) -> bool:
-        """ check if remote file hash is correct """
-        md5 = hashlib.md5()
-        with open(local_file, "rb") as f:
-            md5.update(f.read())
-        local_md5 = md5.hexdigest()
-        logger.debug("file %s md5: %s", os.path.basename(local_file), local_md5)
-        output = self._dev.shell(["toybox", "md5sum", remote_file])
-        if "toybox" in output and "not found" in output:
-            output = self._dev.shell(["md5", remote_file])
-        return local_md5 in output
+    def _check_device_file_size(self, local_file: Union[str, Path], remote_file: str) -> bool:
+        """ check whether remote file exists and has the same size as the local one """
+        local_size = os.path.getsize(local_file)
+        remote_info = self._dev.sync.stat(remote_file)
+        # adbutils returns mtime None when the file does not exist
+        if remote_info.mtime is None:
+            return False
+        logger.debug("file %s size: local=%d remote=%d", os.path.basename(local_file), local_size, remote_info.size)
+        return local_size == remote_info.size
 
     def _wait_ready(self, launch_timeout=30):
         """Wait until uiautomator2 server is ready"""
